@@ -2,7 +2,7 @@
 
 Umbra Denoise is an AI noise remover for linear images in [Siril](https://siril.org). It is a Siril Python script with an AI model. It runs locally on your computer and is free. It was trained for small-scope stacks (Seestar, Dwarf and similar) and also works on DSLR and mono data.
 
-**Status: Beta (v0.1.1).** Expect rough edges.
+**Status: Beta (v0.2.0).** Expect rough edges.
 
 ![Umbra Denoise panel](docs/screenshots/Umbra_Denoise_panel.png)
 
@@ -13,7 +13,7 @@ Umbra Denoise is an AI noise remover for linear images in [Siril](https://siril.
 1. Download the single file [`Umbra_Denoise.py`](https://raw.githubusercontent.com/Kishanhpatel/umbra-denoise/main/Umbra_Denoise.py) (also attached to the [latest release](https://github.com/Kishanhpatel/umbra-denoise/releases/latest)). Save it in any folder you like. Siril has no standard scripts folder name.
 2. In Siril open **Preferences > Scripts**, add that folder, refresh the list, then run **Umbra Denoise** from the Scripts menu.
 3. First run: Siril installs the Python packages the script needs (numpy, onnxruntime, PyQt6, scipy, astropy). This can take a few minutes.
-4. If no model is installed, press **Download model** (Umbra Denoise v3.1 (experimental), about 199 MB). The file is checked with SHA-256 and saved in a folder named `Umbra Denoise` next to the script.
+4. If no model is installed, press **Download model** (Umbra Denoise v3.1 (experimental), about 100 MB). The file is checked with SHA-256 and saved in a folder named `Umbra Denoise` next to the script.
 
 **Manual install.** Download the `.onnx` file from the [release page](https://github.com/Kishanhpatel/umbra-denoise/releases/latest) and put it in the `Umbra Denoise` folder next to the script. To use another folder, set `UMBRA_DENOISE_MODEL_DIR` to it. `UMBRA_DENOISE_MODEL` can point at one specific model file.
 
@@ -38,11 +38,13 @@ Saturated stars are protected so their shapes are not changed.
 
 ## Models
 
+Since v0.2.0 the model files store their weights at half size (16-bit) and compute in full 32-bit precision, so the results are bit-identical to the larger v0.1.x files. If you already have the larger file it keeps working and is not downloaded again.
+
 Models are published as GitHub release assets and are not stored in this repository. See `models/models.json`.
 
 | Name | File | Size | Notes |
 |---|---|---|---|
-| Umbra Denoise v3.1 (experimental) (default, only model) | `umbra_denoise_v3.1_experimental.onnx` | 199 MB | Keeps faint structure well. Star cores can come out about 1% brighter (see Weaknesses). |
+| Umbra Denoise v3.1 (experimental) (default, only model) | `umbra_denoise_v3.1_experimental.onnx` | 100 MB | Keeps faint structure well. Star cores can come out about 1% brighter (see Weaknesses). |
 
 ## Strengths
 
@@ -64,7 +66,14 @@ Models are published as GitHub release assets and are not stored in this reposit
 
 ## GPU acceleration
 
-Providers are tried in this order: CUDA, DirectML (Windows), ROCm (AMD on Linux), Core ML (Mac), then CPU. Each one is checked against the CPU result on a small probe tile before it is used. If the result differs, or the provider fails, the script falls back to the CPU. The status line says which one ran ("Ran on ..."). Set `UMBRA_DENOISE_CPU=1` to force the CPU. On first run the script installs the matching onnxruntime package for your system: `onnxruntime-directml` (Windows), `onnxruntime-gpu` (Linux with an NVIDIA GPU) or plain `onnxruntime` (everything else).
+The GPU is used by default whenever one can be used, and the CPU only as a fallback. Providers are tried in this order: CUDA (NVIDIA), DirectML (Windows), ROCm and MIGraphX (AMD on Linux), OpenVINO (Intel), Core ML (Mac), then CPU. Each one is checked against the CPU result on a small probe tile before it is used; if it fails or the result differs, the script falls back to the CPU. The status line says which one ran ("Ran on ..."). Set `UMBRA_DENOISE_CPU=1` to force the CPU.
+
+On first run the script installs the onnxruntime package that gives your system a GPU:
+
+- **Mac:** `onnxruntime` (Core ML, Apple GPU, built in).
+- **Windows:** `onnxruntime-directml` (any DirectX 12 GPU: NVIDIA, AMD or Intel; no extra downloads).
+- **Linux with an NVIDIA GPU:** `onnxruntime-gpu` (CUDA). If the system has no CUDA 12 / cuDNN 9 libraries, NVIDIA's own pip packages of them are installed too (a one-time download of about 2 to 3 GB).
+- **Linux with AMD or Intel graphics:** there is no GPU build that installs automatically, so these run on the CPU. If you install `onnxruntime-rocm`, `onnxruntime-migraphx` or `onnxruntime-openvino` yourself in Siril's Python, the script uses it.
 
 ## Testing
 
@@ -86,7 +95,7 @@ Small images: the model uses fixed 512 px tiles and its attention depends on the
 
 ## Layout
 
-- `Umbra_Denoise.py`: the script (v0.1.1, ONNX Runtime, with model download and update check)
+- `Umbra_Denoise.py`: the script (v0.2.0, ONNX Runtime, with model download and update check)
 - `models/models.json`: model manifest (name, version, download URL, SHA-256, size)
 - `docs/screenshots/`: panel screenshots
 - `LICENSE`, `LICENSE-MODELS.md`: licenses

@@ -9,13 +9,16 @@
       "default": true,
       "format": "onnx",
       "file": "umbra_denoise_v3.1_experimental.onnx",
-      "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/download/v0.1.0/umbra_denoise_v3.1_experimental.onnx",
-      "sha256": "e5f56fbd0509d5d926d9e353a49afda8d2a921a9b0e44b00cde895c605e227d1",
-      "size_bytes": 198627684
+      "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/download/v0.2.0/umbra_denoise_v3.1_experimental.onnx",
+      "sha256": "b0d5ed94cbdf0897a42f8f299623a4ee631cd60deacc71abb4fea8045e067503",
+      "size_bytes": 99670032,
+      "alt_sha256": [
+        "e5f56fbd0509d5d926d9e353a49afda8d2a921a9b0e44b00cde895c605e227d1"
+      ]
     }
   ],
   "script": {
-    "version": "0.1.1",
-    "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/tag/v0.1.1"
+    "version": "0.2.0",
+    "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/tag/v0.2.0"
   }
 }

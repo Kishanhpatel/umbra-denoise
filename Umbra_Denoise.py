@@ -7,7 +7,8 @@ Run in Siril (Scripts menu), or standalone:
   python Umbra_Denoise.py --image in.fits --out out.fits [--model PATH.onnx] [--denoise 0..1] [--detail 0..1] [--pattern 0..1]
   python Umbra_Denoise.py --ui-test        (opens the window on a fake image, runs Preview once, exits)
   python Umbra_Denoise.py --check-updates | --download [MODEL_ID|all]"""
-VERSION = '0.1.1'
+VERSION = '0.2.0'
+# 0.2.0: GPU by default also on Linux with NVIDIA (CUDA libraries installed on first run if missing); OpenVINO / MIGraphX used when installed; half-size model files with identical results.
 # 0.1.1: buttons, check boxes, drop-down menus and scroll bars now look the same as in Umbra Astro Studio.
 # 0.1.0: First family release (ONNX Runtime, no PyTorch): Preview window, Cancel, model download and update check, remembered settings.
 # ============================================================================================ shared code (src/common.py)
@@ -20,15 +21,26 @@ if __name__ == '__main__' and not _STANDALONE and '--help' not in sys.argv and '
     def _ort_requirement():
         """onnxruntime variant for this machine (all variants import as 'onnxruntime'; only one may be installed). An existing one is kept."""
         import importlib.metadata as _md, platform as _pf, shutil as _sh
-        for n in ('onnxruntime-gpu', 'onnxruntime-directml', 'onnxruntime-rocm', 'onnxruntime'):
+        for n in ('onnxruntime-gpu', 'onnxruntime-directml', 'onnxruntime-rocm', 'onnxruntime-migraphx', 'onnxruntime-openvino', 'onnxruntime'):
             try:
                 _md.version(n); return n
             except Exception:
                 pass
-        if _pf.system() == 'Windows': return 'onnxruntime-directml'          # GPU through DirectX 12 (NVIDIA / AMD / Intel); CUDA needs onnxruntime-gpu
-        if _pf.system() == 'Linux' and _sh.which('nvidia-smi'): return 'onnxruntime-gpu'   # needs the CUDA 12 + cuDNN 9 libraries; falls back to CPU without them
+        if _pf.system() == 'Windows': return 'onnxruntime-directml'          # GPU through DirectX 12 (NVIDIA / AMD / Intel), no extra downloads
+        if _pf.system() == 'Linux' and _sh.which('nvidia-smi'): return 'onnxruntime-gpu'   # CUDA; the CUDA 12 / cuDNN 9 libraries are installed below if missing
         return 'onnxruntime'                                                   # macOS: Core ML is built in; Linux without NVIDIA: CPU
-    _siril_deps.ensure_installed('numpy', _ort_requirement(), 'PyQt6', 'scipy', 'astropy')
+    _ORT_PKG = _ort_requirement()
+    _siril_deps.ensure_installed('numpy', _ORT_PKG, 'PyQt6', 'scipy', 'astropy')
+    if _ORT_PKG == 'onnxruntime-gpu':
+        # GPU by default on NVIDIA: if the system has no CUDA 12 / cuDNN 9 libraries, install NVIDIA's pip packages of them
+        # (onnxruntime loads them with preload_dlls()).  Large one-time download (about 2-3 GB); CPU fallback if anything fails.
+        import ctypes.util as _cu
+        if not _cu.find_library('cudnn'):
+            try:
+                _siril_deps.ensure_installed('nvidia-cuda-runtime-cu12', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cufft-cu12',
+                                             'nvidia-curand-cu12', 'nvidia-cuda-nvrtc-cu12')
+            except Exception as _e:
+                print(f'Could not install the CUDA libraries ({_e}); the script will use the CPU.', flush=True)
 import numpy as np
 import urllib.request
 
@@ -53,6 +65,8 @@ class ToolSpec:
         self.reuse_preview = False       # Gradient: Apply with unchanged settings reuses the preview result
         self.alt = None                  # (button text, info key) second preview layer
         self.progress_unit = 'tile'
+        self.extras = {}                 # extra model files: kind -> file stem prefix (e.g. {'critic': 'umbra_starless_critic'}); not shown in the model picker
+        self.has_editor = False          # Starless: Preview opens the correction-marks editor
         self.__dict__.update(kw)
 
     @property
@@ -80,6 +94,11 @@ class ToolSpec:
         pass
     def post_cli(self, a, dst, info, header, label):
         return ''
+    def prepare_job(self, view, job):
+        """GUI thread, before a run starts: whatever the run needs from the window (snapshot).  Handed to engine_run as `extra`."""
+        return None
+    def engine_run(self, eng, data, params, progress, cancel, extra):
+        return eng.run(data, params, progress=progress, cancel=cancel)
 
 
 def env(spec, name, default=None):
@@ -122,8 +141,28 @@ def model_label(spec, stem):
     return spec.labels.get(stem) or _MANIFEST_NAMES.get((spec.key, stem)) or stem
 
 
+def is_extra(spec, name):
+    """True for a file of an extra kind (e.g. the Auto-keep critic): it is a model file, but never offered as a model."""
+    stem = Path(str(name)).stem
+    return any(stem.startswith(pre) for pre in spec.extras.values())
+
+
+def extra_path(spec, kind):
+    """Newest installed file of an extra kind (e.g. 'critic') in the models folder, or None.  <PREFIX><KIND>_MODEL overrides."""
+    e = env(spec, kind.upper() + '_MODEL')
+    if e:
+        return e if Path(e).is_file() else None
+    pre = spec.extras.get(kind)
+    if not pre:
+        return None
+    files = [f for f in _onnx_files(download_dir(spec)) if f.stem.startswith(pre)]
+    if not files:
+        files = [f for f in _onnx_files(model_dir(spec)[0]) if f.stem.startswith(pre)]
+    return str(sorted(files, key=lambda f: (_version_tuple(f.stem.rsplit('_v', 1)[-1].replace('_experimental', '')) or (0,), f.name))[-1]) if files else None
+
+
 def list_models(spec):
-    items = [(model_label(spec, f.stem), str(f)) for f in _onnx_files(model_dir(spec)[0])]
+    items = [(model_label(spec, f.stem), str(f)) for f in _onnx_files(model_dir(spec)[0]) if not is_extra(spec, f)]
     items.sort(key=lambda it: (0 if Path(it[1]).stem in spec.default_stems else 1, it[0]))
     return items
 
@@ -217,9 +256,9 @@ def import_engine(spec):
         raise RuntimeError(_IMPORT_ERROR['msg']) from e
 
 
-def make_session_factory(prefix):
+def make_session_factory(prefix, skip=()):
     """-> factory(model_path, feed) -> (run_fn, provider_label, note).  run_fn(feed_dict) -> list of outputs (like sess.run(None, feed)).
-    GPU providers are tried in order of preference for the platform (CUDA, DirectML, ROCm, Core ML); each is checked against the CPU
+    GPU providers are tried in order of preference for the platform (CUDA, DirectML, ROCm, MIGraphX, OpenVINO, Core ML); each is checked against the CPU
     provider on one probe feed (outputs must agree to 1e-3 relative) and the first that works is used. Anything missing, failing or
     disagreeing falls through to the next, and finally to the CPU.  <PREFIX>CPU=1 forces the CPU."""
     def factory(model_path, feed):
@@ -235,13 +274,20 @@ def make_session_factory(prefix):
         sess, label = None, 'CPU'
         if not os.environ.get(prefix + 'CPU'):
             avail = ort.get_available_providers()
+            if 'CUDAExecutionProvider' in avail and hasattr(ort, 'preload_dlls'):
+                try:
+                    ort.preload_dlls()          # CUDA / cuDNN from NVIDIA's pip packages, when the system has none
+                except Exception:
+                    pass
             cands = [('CUDAExecutionProvider', 'CUDA', {'use_tf32': '0', 'cudnn_conv_algo_search': 'HEURISTIC'}, False),
                      ('DmlExecutionProvider', 'DirectML', {}, True),
                      ('ROCMExecutionProvider', 'ROCm', {}, False),
+                     ('MIGraphXExecutionProvider', 'MIGraphX', {}, False),
+                     ('OpenVINOExecutionProvider', 'OpenVINO', {'device_type': 'GPU'}, False),
                      ('CoreMLExecutionProvider', 'Core ML', {'ModelFormat': 'MLProgram', 'MLComputeUnits': 'CPUAndGPU'}, False)]
             notes = []
             for name, lab, opts, dml in cands:
-                if name not in avail:
+                if name not in avail or lab in skip:
                     continue
                 try:
                     so2 = ort.SessionOptions(); so2.log_severity_level = 3
@@ -280,7 +326,8 @@ def get_engine(spec, model_path):
     p = Path(str(model_path or ''))
     if not p.is_file():
         raise FileNotFoundError(f'Model not found: {p}')
-    eng = ENGINES[spec.key].Engine(str(p), make_session_factory(spec.prefix))
+    kw = {'critic_factory': make_session_factory(spec.prefix, skip=('Core ML',))} if spec.extras else {}   # the critic has free tile shapes: Core ML is slow there, the CPU takes about 1 s per 1024 px tile
+    eng = ENGINES[spec.key].Engine(str(p), make_session_factory(spec.prefix), **kw)
     _ENGINE_CACHE[spec.key] = (str(p), eng)
     return eng
 
@@ -368,7 +415,8 @@ def _valid_entry(m, upd):
     try:
         f = m['file']
         return (re.fullmatch(r'[A-Za-z0-9._-]{1,120}\.onnx', f) is not None and '..' not in f and _valid_model_url(m['url'], f, upd)
-                and re.fullmatch(r'[0-9a-f]{64}', str(m['sha256']).lower()) is not None and int(m['size_bytes']) > 0 and bool(m.get('name')))
+                and re.fullmatch(r'[0-9a-f]{64}', str(m['sha256']).lower()) is not None and int(m['size_bytes']) > 0 and bool(m.get('name'))
+                and re.fullmatch(r'[a-z]{1,20}', str(m.get('kind', 'model'))) is not None)
     except Exception:
         return False
 
@@ -427,7 +475,9 @@ def model_state(entry, folder):
     p = Path(folder) / entry['file']
     if not p.is_file():
         return 'missing'
-    return 'current' if file_sha256(p) == entry['sha256'] else 'update'
+    # alt_sha256: older files that give identical results (e.g. the same weights stored at full size), so they are not re-downloaded
+    ok = {entry['sha256']} | {str(h).lower() for h in (entry.get('alt_sha256') or []) if isinstance(h, str)}
+    return 'current' if file_sha256(p) in ok else 'update'
 
 
 def entries_for(manifest, tool=None):
@@ -512,7 +562,7 @@ def describe_updates(res, spec):
 def missing_model_message(spec, res=None):
     """Status text when no model is installed."""
     if res:
-        d = next((m for m, st in res['models'] if st == 'missing' and m.get('default')), None) or next((m for m, st in res['models'] if st == 'missing'), None)
+        d = next((m for m, st in res['models'] if st == 'missing' and m.get('default') and not m.get('kind')), None) or next((m for m, st in res['models'] if st == 'missing' and not m.get('kind')), None)
         if d:
             return f"No model installed. Press Download model to get {d['name']} ({d['size_bytes'] / 1e6:.0f} MB)."
     return f'No model installed. Press Download model, or put a .onnx file in {model_dir(spec)[0]}.'
@@ -807,9 +857,9 @@ def _qt():
         prog = pyqtSignal(int, int)
         stage = pyqtSignal(str)
 
-        def __init__(self, spec, model_path, data, params):
+        def __init__(self, spec, model_path, data, params, extra=None):
             super().__init__()
-            self.spec, self.model_path, self.data, self.params = spec, model_path, data, params
+            self.spec, self.model_path, self.data, self.params, self.extra = spec, model_path, data, params, extra
             self.cancel_flag = False
 
         def run(self):
@@ -821,7 +871,7 @@ def _qt():
                 eng = get_engine(self.spec, self.model_path)
                 loading = False
                 self.stage.emit('Running…')
-                out, info = eng.run(self.data, self.params, progress=lambda n, t: self.prog.emit(int(n), int(t)), cancel=lambda: self.cancel_flag)
+                out, info = self.spec.engine_run(eng, self.data, self.params, lambda n, t: self.prog.emit(int(n), int(t)), lambda: self.cancel_flag, self.extra)
                 self.done.emit(out, info, time.time() - t0, eng.provider, eng.note)
             except Exception as e:
                 if not loading and str(e) == 'Cancelled':
@@ -1213,6 +1263,11 @@ def _qt():
                 return download_model(entry, self.upd, download_dir(self.spec), progress=prog)
             def done(path):
                 self.info = None
+                if entry.get('kind'):               # an extra file (e.g. the Auto-keep model): not a model for the picker
+                    self.dl_btn.setStyleSheet('' if self.model_path() else self.dl_btn.styleSheet())
+                    getattr(self.panel, 'extras_changed', lambda: None)()
+                    self.set_status(f"Installed {entry['name']}. " + self.idle_msg)
+                    return
                 self.refresh_models(select=str(path))
                 self.set_status(f"Installed {entry['name']}. " + self.idle_msg)
             self.run_net(work, done, f"Downloading {entry['name']}…")
@@ -1222,6 +1277,9 @@ def _qt():
             if self.worker is not None and self.worker.isRunning():
                 self.worker.cancel_flag = True
                 self.cancel_btn.setEnabled(False)
+            hook = getattr(self.panel, 'cancel', None)
+            if hook is not None:
+                hook()
 
         def read_image(self, kind):
             """-> (data, meta, identity, header_text, region note, rect)"""
@@ -1239,6 +1297,9 @@ def _qt():
         def start(self, kind):
             if self.busy:
                 return
+            if getattr(self.panel, 'editor_busy', lambda: False)():
+                self.set_status('The preview window is still working. Wait until it has finished.')
+                return
             sp = self.spec
             path = self.model_path()
             if not path:
@@ -1251,6 +1312,10 @@ def _qt():
                 return
             params = dict(self.panel.params())
             params.update(sp.image_params(htxt))
+            if kind == 'preview' and sp.has_editor:
+                self.save_prefs()
+                self.panel.open_editor(self, data, meta, identity, params, path)
+                return
             rect, region, crop = None, 'whole image', None
             full = data
             if kind == 'preview':
@@ -1290,12 +1355,17 @@ def _qt():
                     else:
                         print(msg, flush=True)
             self.job = dict(kind=kind, meta=meta, identity=identity, params=params, region=region, data=data, key=key, htxt=htxt, rect=rect, crop=crop)
+            try:
+                extra = sp.prepare_job(self, self.job)
+            except Exception as e:
+                self.set_status(str(e), True)
+                return
             self.result = None; self.last_error = None
             self.save_prefs()
             self.set_busy(True)
             self.cancel_btn.setEnabled(True)
             self.set_status('Loading model…' if str(path) not in [c[0] for c in _ENGINE_CACHE.values()] else 'Running…')
-            self.worker = Worker(sp, path, data, params)
+            self.worker = Worker(sp, path, data, params, extra)
             self.worker.stage.connect(self.set_status)
             self.worker.prog.connect(self.on_progress)
             self.worker.done.connect(self.finish)
@@ -1379,6 +1449,7 @@ def _qt():
                     t.wait(8000)
             if self.preview is not None:
                 self.preview.close()
+            getattr(self.panel, 'shutdown', lambda: None)()
 
     class MainWindow(QWidget):
         def __init__(self, specs, combined, siril=None, fake_image=None, smoke=False):
@@ -1459,7 +1530,7 @@ def _qt():
             super().closeEvent(e)
 
     _QT['ns'] = types.SimpleNamespace(**{k: v for k, v in locals().items() if k in (
-        'Worker', 'Task', 'PreviewWindow', 'Ui', 'ToolView', 'MainWindow', 'QApplication', 'QTimer')})
+        'Worker', 'Task', 'PreviewWindow', 'Ui', 'ToolView', 'MainWindow', 'QApplication', 'QTimer', 'ModernComboBox', 'qimage')})
     return _QT['ns']
 
 
@@ -1497,6 +1568,9 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
             return
         pre = f'Umbra_Astro_AI_{key}' if combined else win.view().spec.script
         win.grab().save(str(outdir / f'{pre}_panel.png'))
+        ed = getattr(v.panel, 'ed', None)
+        if ed is not None and ed.isVisible():
+            ed.grab().save(str(outdir / f'{pre}_editor.png'))
         if v.preview is not None and v.preview.isVisible():
             v.preview.grab().save(str(outdir / f'{pre}_preview.png'))
             if v.preview.alt_btn is not None and v.preview.alt_btn.isVisible():
@@ -1530,8 +1604,16 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
         if v.busy and time.time() - state['t0'] < 900:
             q.QTimer.singleShot(250, lambda: poll(v, key))
             return
-        ok = v.last_error is None and v.result is not None and bool(np.isfinite(v.result).all()) and v.last_preview is not None
-        if ok:
+        ed = getattr(v.panel, 'ed', None)
+        if v.spec.has_editor:
+            ed.wait_idle()
+            ok = ed.res is not None and bool(np.isfinite(ed.res['out']).all()) and not v.busy
+            if ok:
+                ed.orig_btn.pressed.emit(); ok &= ed.holding; ed.orig_btn.released.emit(); ok &= not ed.holding
+                v.status.setText(f'Editor: Remove Stars {ed.timings.get("remove", 0):.1f} s, {ed.shape[1]}x{ed.shape[0]} px.')
+        else:
+            ok = v.last_error is None and v.result is not None and bool(np.isfinite(v.result).all()) and v.last_preview is not None
+        if ok and not v.spec.has_editor:
             v.preview.orig_btn.pressed.emit(); ok &= v.preview.current_key() == 'before'; v.preview.orig_btn.released.emit(); ok &= v.preview.current_key() == 'after'
         print(f'UI TEST {key}: {"OK" if ok else "FAILED"} {v.status.text()}', flush=True)
         state['ok'] &= ok
@@ -1539,6 +1621,8 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
         snap(v, key)
         if v.preview is not None:
             v.preview.close()
+        if ed is not None:
+            ed.shutdown()
         state['i'] += 1
         q.QTimer.singleShot(50, next_tool)
     q.QTimer.singleShot(100, next_tool)
@@ -1575,7 +1659,7 @@ def run_file(spec, a):
         raise SystemExit(f'No model installed. Run with --download, or put a .onnx file in {model_dir(spec)[0]}.')
     t0 = time.time()
     eng = get_engine(spec, path)
-    out, info = eng.run(data, params, progress=None, cancel=None)
+    out, info = spec.engine_run(eng, data, params, None, None, None)
     label = f"{spec.name} {VERSION} {spec.label(params)}"
     write_out = spec.output(params, out, info)
     for k in ('BSCALE', 'BZERO', 'BLANK'):
