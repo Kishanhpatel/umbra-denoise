@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.onnx
+*.pt
+*.fit
+*.fits
+*.fts
+*.xisf
+*.tif
+*.tiff
+_work/
+*.png
+*.jpg
+*.jpeg
+!docs/screenshots/*.png

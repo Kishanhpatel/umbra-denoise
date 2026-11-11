@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "id": "umbra_denoise_v3.1_experimental",
+      "name": "Umbra Denoise v3.1 (experimental)",
+      "version": "3.1",
+      "experimental": true,
+      "default": true,
+      "format": "onnx",
+      "file": "umbra_denoise_v3.1_experimental.onnx",
+      "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/download/v0.1.0/umbra_denoise_v3.1_experimental.onnx",
+      "sha256": "e5f56fbd0509d5d926d9e353a49afda8d2a921a9b0e44b00cde895c605e227d1",
+      "size_bytes": 198627684
+    }
+  ],
+  "script": {
+    "version": "0.1.0",
+    "url": "https://github.com/Kishanhpatel/umbra-denoise/releases/tag/v0.1.0"
+  }
+}
