@@ -2,7 +2,7 @@
 
 Umbra Denoise is an AI noise remover for linear images in [Siril](https://siril.org). It is a Siril Python script with an AI model. It runs locally on your computer and is free. It was trained for small-scope stacks (Seestar, Dwarf and similar) and also works on DSLR and mono data.
 
-**Status: Beta (v0.1.0).** Expect rough edges.
+**Status: Beta (v0.1.1).** Expect rough edges.
 
 ![Umbra Denoise panel](docs/screenshots/Umbra_Denoise_panel.png)
 
@@ -86,7 +86,7 @@ Small images: the model uses fixed 512 px tiles and its attention depends on the
 
 ## Layout
 
-- `Umbra_Denoise.py`: the script (v0.1.0, ONNX Runtime, with model download and update check)
+- `Umbra_Denoise.py`: the script (v0.1.1, ONNX Runtime, with model download and update check)
 - `models/models.json`: model manifest (name, version, download URL, SHA-256, size)
 - `docs/screenshots/`: panel screenshots
 - `LICENSE`, `LICENSE-MODELS.md`: licenses

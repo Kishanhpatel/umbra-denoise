@@ -7,8 +7,9 @@ Run in Siril (Scripts menu), or standalone:
   python Umbra_Denoise.py --image in.fits --out out.fits [--model PATH.onnx] [--denoise 0..1] [--detail 0..1] [--pattern 0..1]
   python Umbra_Denoise.py --ui-test        (opens the window on a fake image, runs Preview once, exits)
   python Umbra_Denoise.py --check-updates | --download [MODEL_ID|all]"""
-VERSION = '0.1.0'
-# First family release (ONNX Runtime, no PyTorch): Preview window, Cancel, model download and update check, remembered settings.
+VERSION = '0.1.1'
+# 0.1.1: buttons, check boxes, drop-down menus and scroll bars now look the same as in Umbra Astro Studio.
+# 0.1.0: First family release (ONNX Runtime, no PyTorch): Preview window, Cancel, model download and update check, remembered settings.
 # ============================================================================================ shared code (src/common.py)
 # Everything the five scripts share: dependency install, ONNX Runtime sessions, updater, preferences, Siril I/O, family UI, CLI.
 import sys, os, json, hashlib, argparse, time, math, re, types
@@ -710,20 +711,34 @@ def to_rgb8(img, params, flip=False):
 STYLE = """
 QWidget { background: #242424; color: #dddddd; font-size: 10pt; }
 QWidget#Card { background: #303030; border-radius: 10px; }
-QLabel, QCheckBox, QSlider { background: transparent; }
+QLabel, QCheckBox, QRadioButton, QSlider { background: transparent; }
 QLabel#Title { font-size: 15pt; font-weight: bold; color: #dddddd; }
 QLabel#Badge { color: #888888; font-size: 8pt; }
 QLabel#Note { color: #999999; font-size: 9pt; }
 QLabel#Value { color: #dddddd; font-weight: bold; min-width: 40px; }
 QLabel#Caption { color: #aaaaaa; font-size: 9pt; }
-QComboBox { background: #404040; border: 1px solid #666666; border-radius: 4px; padding: 3px 6px; }
-QComboBox QAbstractItemView { background: #303030; selection-background-color: #1274d5; }
-QPushButton { min-height: 20px; background: #505050; border: 1px solid #666666; border-radius: 5px; padding: 6px 12px; }
+QToolTip { color: #dddddd; background: #404040; border: 1px solid #666666; padding: 6px; }
+QCheckBox { spacing: 4px; background: transparent; }
+QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid #777777; border-radius: 3px; background: #3c3c3c; }
+QCheckBox::indicator:checked { background: #1679db; border-color: #6eb5ff; }
+QCheckBox::indicator:disabled { border-color: #555555; background: #2e2e2e; }
+QComboBox { background: transparent; border: none; padding: 5px 25px 5px 9px; min-height: 18px; }
+QComboBox QAbstractItemView { background: #3d3d3d; color: #dddddd; border: 1px solid #666666; border-radius: 9px; padding: 5px; selection-background-color: #1679db; outline: 0; }
+QComboBox QAbstractItemView::item { padding: 5px 8px; border-radius: 5px; }
+QPushButton { background: #505050; border: 1px solid #666666; border-radius: 5px; padding: 4px 7px; }
 QPushButton:hover { background: #616161; }
-QPushButton:checked { background: #1274d5; border-color: #338be7; color: #ffffff; }
+QPushButton:checked { background: #1474d5; border-color: #358eef; }
 QPushButton:disabled { color: #777777; border-color: #444444; }
-QPushButton#Apply { min-height: 20px; background: #1274d5; color: #ffffff; font-weight: bold; border-color: #338be7; }
+QPushButton#Apply { background: #1274d5; color: #ffffff; font-weight: bold; border-color: #338be7; }
 QPushButton#Apply:disabled { background: #354656; color: #808890; border-color: #43505c; }
+QScrollArea { border: none; background: #242424; }
+QScrollBar:vertical { background: #242424; width: 8px; margin: 0; }
+QScrollBar::handle:vertical { background: #555555; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: #242424; height: 8px; margin: 0; }
+QScrollBar::handle:horizontal { background: #555555; border-radius: 4px; min-width: 24px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal, QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QSlider::groove:horizontal { height: 4px; background: #505050; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #1474d5; border-radius: 2px; }
 QSlider::handle:horizontal { background: #dddddd; width: 14px; margin: -6px 0; border-radius: 7px; }
@@ -745,6 +760,45 @@ def _qt():
     from PyQt6.QtGui import QImage, QPixmap
     from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QProgressBar,
                                  QComboBox, QCheckBox, QSizePolicy, QStackedWidget, QMenu, QLayout)
+
+    from PyQt6.QtCore import QPointF, QRectF
+    from PyQt6.QtGui import QPainter, QPen, QColor
+    from PyQt6.QtWidgets import QListView, QFrame
+
+    class ModernComboBox(QComboBox):
+        """Rounded drop-down, drawn the same on every platform (same look as Umbra Astro Studio)."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setMinimumHeight(28)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            view = QListView(self); view.setFrameShape(QFrame.Shape.NoFrame); view.setSpacing(1); self.setView(view)
+
+        def paintEvent(self, event):
+            p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(QColor('#4398ed') if self.hasFocus() else QColor('#666666'), 1))
+            p.setBrush(QColor('#606060') if (self.underMouse() and self.isEnabled()) else QColor('#505050'))
+            p.drawRoundedRect(QRectF(.5, .5, self.width() - 1, self.height() - 1), 8, 8)
+            p.setPen(QColor('#dddddd') if self.isEnabled() else QColor('#888888')); p.setFont(self.font())
+            text = self.fontMetrics().elidedText(self.currentText(), Qt.TextElideMode.ElideRight, max(1, self.width() - 35))
+            p.drawText(self.rect().adjusted(9, 0, -27, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+            cx, cy = self.width() - 15, self.height() / 2
+            p.setPen(QPen(QColor('#dddddd') if self.isEnabled() else QColor('#888888'), 1.7))
+            p.drawLine(QPointF(cx - 4, cy - 2), QPointF(cx, cy + 2)); p.drawLine(QPointF(cx, cy + 2), QPointF(cx + 4, cy - 2)); p.end()
+
+        def enterEvent(self, event):
+            super().enterEvent(event); self.update()
+
+        def leaveEvent(self, event):
+            super().leaveEvent(event); self.update()
+
+        def showPopup(self):
+            super().showPopup()
+            container = self.view().window()
+            container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            container.setObjectName('RoundedComboPopup')
+            container.setStyleSheet('QFrame#RoundedComboPopup {background:#3d3d3d;border:1px solid #666666;border-radius:10px;padding:4px;} '
+                                    'QListView {background:#3d3d3d;color:#dddddd;border:none;border-radius:7px;padding:3px;outline:0;} '
+                                    'QListView::item {padding:5px 8px;border-radius:5px;} QListView::item:selected {background:#1679db;}')
 
     class Worker(QThread):
         done = pyqtSignal(object, object, float, str, object)
@@ -911,7 +965,7 @@ def _qt():
             row = QHBoxLayout()
             label = QLabel(text)
             row.addWidget(label)
-            cb = QComboBox()
+            cb = ModernComboBox()
             for t, v in items:
                 cb.addItem(t, v)
             if tip:
@@ -973,16 +1027,16 @@ def _qt():
             cl.setContentsMargins(12, 10, 12, 12)
             mrow = QHBoxLayout()
             mrow.addWidget(QLabel('Model'))
-            self.model_box = QComboBox()
+            self.model_box = ModernComboBox()
             mrow.addWidget(self.model_box, 1)
             cl.addLayout(mrow)
             brow = QHBoxLayout()
             self.dl_btn = QPushButton('Download model')
-            self.dl_btn.setMinimumHeight(30)
+            self.dl_btn.setMinimumHeight(26)
             self.dl_btn.setToolTip("Download a model from this project's GitHub releases (checked against a SHA-256 before it is installed).")
             self.dl_btn.clicked.connect(self.show_dl_menu)
             self.upd_btn = QPushButton('Check for updates')
-            self.upd_btn.setMinimumHeight(30)
+            self.upd_btn.setMinimumHeight(26)
             self.upd_btn.setToolTip('Looks for newer models and a newer script. Nothing is downloaded or replaced until you ask.')
             self.upd_btn.clicked.connect(lambda: self.fetch_info(manual=True))
             brow.addWidget(self.dl_btn); brow.addWidget(self.upd_btn)
@@ -1349,7 +1403,7 @@ def _qt():
                 tl.addWidget(QLabel(f'v{VERSION}', objectName='Badge'))
                 row = QHBoxLayout()
                 row.addWidget(QLabel('Tool'))
-                self.tool_box = QComboBox()
+                self.tool_box = ModernComboBox()
                 for s in specs:
                     self.tool_box.addItem(s.name, s.key)
                 row.addWidget(self.tool_box, 1)
