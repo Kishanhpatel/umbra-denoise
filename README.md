@@ -2,22 +2,24 @@
 
 Umbra Denoise is an AI noise remover for linear images in [Siril](https://siril.org). It is a Siril Python script with an AI model. It runs locally on your computer and is free. It was trained for small-scope stacks (Seestar, Dwarf and similar) and also works on DSLR and mono data.
 
-**Status: Beta (v0.2.0).** Expect rough edges.
+**Status: Beta (v0.3.0).** Expect rough edges.
 
-![Umbra Denoise panel](docs/screenshots/Umbra_Denoise_panel.png)
+![Umbra Denoise window before running, with the green update note](docs/screenshots/Umbra_Denoise_panel_updnote.png)
 
-![Umbra Denoise panel](docs/screenshots/Umbra_Denoise_panel_updnote.png)
+![Umbra Denoise window after Apply](docs/screenshots/Umbra_Denoise_panel.png)
+
+*Screenshots (synthetic test image): the window before running, and after Apply.*
 
 ## Download and install
 
 1. Download the single file [`Umbra_Denoise.py`](https://raw.githubusercontent.com/Kishanhpatel/umbra-denoise/main/Umbra_Denoise.py) (also attached to the [latest release](https://github.com/Kishanhpatel/umbra-denoise/releases/latest)). Save it in any folder you like. Siril has no standard scripts folder name.
 2. In Siril open **Preferences > Scripts**, add that folder, refresh the list, then run **Umbra Denoise** from the Scripts menu.
 3. First run: Siril installs the Python packages the script needs (numpy, onnxruntime, PyQt6, scipy, astropy). This can take a few minutes.
-4. If no model is installed, press **Download model** (Umbra Denoise v3.1 (experimental), about 100 MB). The file is checked with SHA-256 and saved in a folder named `Umbra Denoise` next to the script.
+4. If no model is installed, the model drop-down lists it as "Umbra Denoise v3.1 (experimental) (Not Downloaded)". Select it and press **Download**, right of the drop-down (about 100 MB). The file is checked with SHA-256 and saved in a folder named `Umbra Denoise` next to the script.
 
 **Manual install.** Download the `.onnx` file from the [release page](https://github.com/Kishanhpatel/umbra-denoise/releases/latest) and put it in the `Umbra Denoise` folder next to the script. To use another folder, set `UMBRA_DENOISE_MODEL_DIR` to it. `UMBRA_DENOISE_MODEL` can point at one specific model file.
 
-**Updates.** **Check for updates** compares your installed models and the script version with the published list (`models/models.json`). A new or changed model downloads only when you press the button. A newer script is shown as a link to the release page; the script never replaces itself. Nothing is sent about you or your computer (only a generic client name). With no network the installed models keep working. Set `UMBRA_DENOISE_OFFLINE=1` (or `UMBRA_OFFLINE=1`) to turn the lookup off.
+**Updates.** Each time the script opens, it checks the published list (`models/models.json`) for a newer script and for new or changed models. A line under the model row shows the result. In green: "The models for this tool are up to date." In yellow: "There is an update to this script available" or "There is a new model available for this tool, select the model in the dropdown and click Download to install." A model downloads only when you press **Download**. A newer script is shown as a link to the release page; the script never replaces itself. Nothing is sent about you or your computer (only a generic client name). With no network the installed models keep working. Set `UMBRA_DENOISE_OFFLINE=1` (or `UMBRA_OFFLINE=1`) to turn the lookup off.
 
 ## What it does
 
@@ -30,9 +32,9 @@ The model removes noise and leaves levels and colours above about 32 px untouche
 Saturated stars are protected so their shapes are not changed.
 
 
-**Preview.** The **Preview** button opens a separate, resizable window. It shows a region of the image before and after (same stretch for both): your current Siril selection if it is at least 64 px, otherwise a centred 768 x 768 crop (the whole image if smaller). Small selections are processed with some surrounding image for context, then cropped back. Hold down **Show original** (or the Space key) to see the original; release it to see the result again. It never changes the image in Siril.
+**The window.** The window has a fixed-width controls column on the left and a large image area on the right. The image area shows the current image (auto-stretched) as soon as the window opens. Scroll or pinch to zoom and drag to pan. Double-click the image or press **Fit** to fit the whole image. Hold down **Show original** (or the Space key) to compare with the original; release it to see the result again. The window keeps its size when you switch tools or models.
 
-**Apply.** **Apply** replaces the image in Siril with the result. Use Siril's **Undo** to go back. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
+**Apply and Apply to Siril.** **Apply** runs the tool on the whole image and shows the result in the image area. The image in Siril is not changed. **Apply to Siril** writes the result to the image in Siril. Use Siril's **Undo** to go back. If nothing changed since **Apply**, the result shown is reused. **Undo all** (bottom row, between **Close** and **Apply to Siril**) puts back the image as it was when the window opened. It becomes active after an **Apply to Siril**. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
 
 **Command line.** `python Umbra_Denoise.py --image IN.fits --out OUT.fits` runs the tool without a window. Flags: `--denoise 0..1`, `--detail 0..1`, `--pattern 0..1`, `--model PATH`. `--check-updates` and `--download [MODEL_ID|all]` work from the command line too, and `--help` lists everything.
 
@@ -95,7 +97,7 @@ Small images: the model uses fixed 512 px tiles and its attention depends on the
 
 ## Layout
 
-- `Umbra_Denoise.py`: the script (v0.2.0, ONNX Runtime, with model download and update check)
+- `Umbra_Denoise.py`: the script (v0.3.0, ONNX Runtime, with model download and update check)
 - `models/models.json`: model manifest (name, version, download URL, SHA-256, size)
 - `docs/screenshots/`: panel screenshots
 - `LICENSE`, `LICENSE-MODELS.md`: licenses
