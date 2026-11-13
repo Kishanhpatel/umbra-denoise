@@ -32,9 +32,17 @@ The model removes noise and leaves levels and colours above about 32 px untouche
 Saturated stars are protected so their shapes are not changed.
 
 
-**The window.** The window has a fixed-width controls column on the left and a large image area on the right. The image area shows the current image (auto-stretched) as soon as the window opens. Scroll or pinch to zoom and drag to pan. Double-click the image or press **Fit** to fit the whole image. Hold down **Show original** (or the Space key) to compare with the original; release it to see the result again. The window keeps its size when you switch tools or models.
+**The window.** The window has a fixed-width controls column on the left and a large image area on the right. The image area shows the current image (auto-stretched) as soon as the window opens. Scroll or pinch to zoom and drag to pan. Double-click the image or press **Fit** to fit the whole image. Hold down **Show original**, or hold the Space key anywhere in the window, to compare with the image before the tool; release it to see the result again. **Undo** and **Redo** at the top left of the image area step back and forward through your Apply results (Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z); the last 10 steps are kept. The window keeps its size when you switch tools or models.
 
-**Apply and Apply to Siril.** **Apply** runs the tool on the whole image and shows the result in the image area. The image in Siril is not changed. **Apply to Siril** writes the result to the image in Siril. Use Siril's **Undo** to go back. If nothing changed since **Apply**, the result shown is reused. **Undo all** (bottom row, between **Close** and **Apply to Siril**) puts back the image as it was when the window opened. It becomes active after an **Apply to Siril**. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
+**Apply and Apply to Siril.** **Apply** (the small blue button inside the tool's panel) runs the tool on the whole image and shows the result in the image area. The image in Siril is not changed. **Apply to Siril** writes the current result to the image in Siril as one step, so Siril's **Undo** goes back. If you changed the settings since **Apply**, it runs the tool first. Until then the image in Siril is not changed, whatever you do in the window. **Undo all** (bottom row, between **Close** and **Apply to Siril**) goes back to the image as it was when the window opened, and also puts it back in Siril if you had written anything; **Redo** can still bring the steps back. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
+
+**Restore, Clone and Eraser brushes.** A second panel under the tool's settings is greyed out until **Apply** has made a result. Then:
+- **Restore**: paint where you want the image from before this tool back (for example where the tool went too far).
+- **Clone**: copies from the blue source ring, like the clone tool in Umbra Astro Studio. Drag the ring onto a clean area, then paint over what you want to cover. While you paint, a second ring shows where it is copying from, and the brush shows a preview of the patch.
+- **Eraser** (or right-click with any brush): takes Restore and Clone marks away again.
+- **Brush size** (keys **[** and **]** make it smaller and bigger), **Opacity**, **Show marks**, **Clear marks**.
+
+Click a pressed brush again to go back to pan and zoom. The result updates after each stroke without running the AI again, and the brushes stay part of the same Apply step (one Undo removes it). Marks are cleared when the image the tool starts from changes.
 
 **Command line.** `python Umbra_Denoise.py --image IN.fits --out OUT.fits` runs the tool without a window. Flags: `--denoise 0..1`, `--detail 0..1`, `--pattern 0..1`, `--model PATH`. `--check-updates` and `--download [MODEL_ID|all]` work from the command line too, and `--help` lists everything.
 
@@ -85,6 +93,7 @@ Tested:
 - macOS 26 on an Apple M3, with Core ML and with the CPU.
 - Standalone (command line and window test) and inside Siril 1.4.5 run headless (`siril-cli` with `pyscript`): read the image, process it, write it back with an Undo state, save.
 - The window was tested offscreen only.
+- v0.4.0: the shared history (Apply, Undo, Redo, Apply to Siril, Undo all), the brushes (including Clone) and the Space / [ ] keys were tested offscreen with a stand-in for Siril and synthetic mouse drags, not yet in the Siril window itself.
 
 NOT tested:
 - Windows and Linux.

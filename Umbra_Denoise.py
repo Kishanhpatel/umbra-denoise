@@ -7,7 +7,8 @@ Run in Siril (Scripts menu), or standalone:
   python Umbra_Denoise.py --image in.fits --out out.fits [--model PATH.onnx] [--denoise 0..1] [--detail 0..1] [--pattern 0..1]
   python Umbra_Denoise.py --ui-test        (opens the window on a fake image, runs Apply once, exits)
   python Umbra_Denoise.py --check-updates | --download [MODEL_ID|all]"""
-VERSION = '0.3.0'
+VERSION = '0.4.0'
+# 0.4.0: edits carry over between tools (Denoise, then Deblur starts from the denoised image); Undo / Redo above the image (Cmd/Ctrl+Z); Undo all fixed (back to the opened image, also in Siril); Apply is a small blue button inside the panel; drop-down menus show the whole list; hold Space anywhere to see the original, [ and ] change the brush size; second panel with Restore (paint back the image from before the tool), Clone (drag the blue source ring, paint to copy, like Umbra Astro Studio) and Eraser brushes.
 # 0.3.0: new window like Umbra Guided GHS: fixed controls column, zoomable image on the right that shows the original at once; Apply shows the result there, Apply to Siril writes it, Undo all puts back the starting image; Download sits next to the model list, models not installed are listed as (Not Downloaded), and the update check runs at every start (green / yellow note).
 # 0.2.0: GPU by default also on Linux with NVIDIA (CUDA libraries installed on first run if missing); OpenVINO / MIGraphX used when installed; half-size model files with identical results.
 # 0.1.1: buttons, check boxes, drop-down menus and scroll bars now look the same as in Umbra Astro Studio.
@@ -69,6 +70,8 @@ class ToolSpec:
         self.extras = {}                 # extra model files: kind -> file stem prefix (e.g. {'critic': 'umbra_starless_critic'}); not shown in the model picker
         self.has_editor = False          # Starless: an Edit marks button opens the correction-marks editor
         self.inline_preview = True       # every tool: Apply shows the result in the pane, Apply to Siril writes it
+        self.restore_brush = True        # second card with the Restore brush (Starless has its own Remove / Keep card instead)
+        self.apply_top = False           # Starless: Apply sits on the left right under the model row; the panel puts its controls in panel.card2
         self.__dict__.update(kw)
 
     @property
@@ -792,6 +795,163 @@ def to_rgb8(img, params, flip=False):
     return rgb[::-1].copy() if flip else rgb
 
 
+SOFTNESS = 0.35
+REMOVE_RGB, KEEP_RGB = (255, 60, 60), (60, 220, 90)
+
+
+# ----------------------------------------------------------------------------------------------- brush masks (shared: Starless marks, Restore brush in the other tools)
+def smoothstep(a, b, x):
+    if b <= a + 1e-8:
+        return (x >= b).astype(np.float32)
+    t = np.clip((x - a) / (b - a), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def brush_mask(shape, strokes, window=None):
+    """Replay portable normalized strokes (points in 0..1 of the image, row-down; size = brush diameter / min(h, w)).
+    One stroke has uniform maximum opacity: distance to line segments avoids holes between sparse pointer events and the
+    maximum dab coverage within a stroke avoids speed-dependent buildup. Separate strokes alpha-composite, including erasure.
+    window=(x0,y0,x1,y1) renders only that part of the full-size mask."""
+    h, w = shape
+    X0, Y0, X1, Y1 = window if window is not None else (0, 0, w, h)
+    canvas = np.zeros((Y1 - Y0, X1 - X0), np.float32)
+    sx = max(w - 1, 1)
+    sy = max(h - 1, 1)
+    for stroke in strokes:
+        points = np.asarray(stroke['points'], np.float32) * np.array([sx, sy], np.float32)
+        if not len(points):
+            continue
+        radius = max(.5 * stroke['size'] * min(h, w), .5)
+        x0 = max(X0, int(np.floor(points[:, 0].min() - radius)))
+        x1 = min(X1, int(np.ceil(points[:, 0].max() + radius)) + 1)
+        y0 = max(Y0, int(np.floor(points[:, 1].min() - radius)))
+        y1 = min(Y1, int(np.ceil(points[:, 1].max() + radius)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        coverage = np.zeros((y1 - y0, x1 - x0), np.float32)
+        segments = zip(points[:-1], points[1:]) if len(points) > 1 else [(points[0], points[0])]
+        for a, b in segments:
+            xa = max(x0, int(np.floor(min(a[0], b[0]) - radius)))
+            xb = min(x1, int(np.ceil(max(a[0], b[0]) + radius)) + 1)
+            ya = max(y0, int(np.floor(min(a[1], b[1]) - radius)))
+            yb = min(y1, int(np.ceil(max(a[1], b[1]) + radius)) + 1)
+            if xb <= xa or yb <= ya:
+                continue
+            yy, xx = np.ogrid[ya:yb, xa:xb]
+            dx, dy = b - a
+            den = float(dx * dx + dy * dy)
+            t = np.clip(((xx - a[0]) * dx + (yy - a[1]) * dy) / max(den, 1e-12), 0, 1)
+            distance = np.sqrt((xx - a[0] - t * dx) ** 2 + (yy - a[1] - t * dy) ** 2)
+            if stroke['softness'] <= 1e-6:
+                weight = (distance <= radius).astype(np.float32)
+            else:
+                weight = 1 - smoothstep(radius * (1 - stroke['softness']), radius, distance)
+            patch = coverage[ya - y0:yb - y0, xa - x0:xb - x0]
+            np.maximum(patch, weight, out=patch)
+        alpha = coverage * stroke['opacity']
+        patch = canvas[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+        if stroke['erase']:
+            patch *= 1 - alpha
+        else:
+            patch += alpha * (1 - patch)
+    return np.clip(canvas, 0, 1)
+
+
+def stroke_layers(strokes, layer):
+    """Strokes that make up one mask: its own strokes plus every eraser stroke (the eraser works on both layers, in order)."""
+    return [s for s in strokes if s['layer'] == layer or s['erase']]
+
+
+def has_paint(strokes, layer):
+    return any(not s['erase'] for s in stroke_layers(strokes, layer))
+
+
+def strokes_signature(strokes):
+    return hashlib.sha1(json.dumps(strokes, sort_keys=True).encode()).hexdigest()
+
+
+def brush_fraction(v):
+    """Brush slider 1..100 -> stroke 'size' (diameter as a fraction of min(h, w))."""
+    return 0.0008 + (v / 100.0) ** 2 * 0.12
+
+
+def masks_from_strokes(strokes, shape, flip=False):
+    """(mask_remove, mask_keep) float32 (H,W) in ARRAY row order from strokes drawn in display coordinates (row 0 = top of the picture).
+    flip=True: the picture is the array flipped vertically (Siril shows its bottom-up rows flipped), so the masks are flipped back."""
+    out = []
+    for layer in ('remove', 'keep'):
+        if has_paint(strokes, layer):
+            m = brush_mask(shape, stroke_layers(strokes, layer))
+            out.append(np.ascontiguousarray(m[::-1] if flip else m, np.float32))
+        else:
+            out.append(None)
+    return out[0], out[1]
+
+
+def _bilinear(img, mx, my):
+    """img (C,H,W); mx, my float pixel coordinates (same shape) -> (C, *mx.shape) samples (edge-clamped)."""
+    H, W = img.shape[-2:]
+    x0 = np.clip(np.floor(mx).astype(np.int64), 0, W - 1); y0 = np.clip(np.floor(my).astype(np.int64), 0, H - 1)
+    x1 = np.minimum(x0 + 1, W - 1); y1 = np.minimum(y0 + 1, H - 1)
+    fx = np.clip(mx - x0, 0, 1).astype(np.float32); fy = np.clip(my - y0, 0, 1).astype(np.float32)
+    a, b, c, d = img[:, y0, x0], img[:, y0, x1], img[:, y1, x0], img[:, y1, x1]
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+
+
+def _stroke_window(shape, stroke):
+    h, w = shape
+    pts = np.asarray(stroke['points'], np.float32) * np.array([max(w - 1, 1), max(h - 1, 1)], np.float32)
+    r = max(.5 * stroke['size'] * min(h, w), .5)
+    return (max(0, int(np.floor(pts[:, 0].min() - r)) - 1), max(0, int(np.floor(pts[:, 1].min() - r)) - 1),
+            min(w, int(np.ceil(pts[:, 0].max() + r)) + 2), min(h, int(np.ceil(pts[:, 1].max() + r)) + 2))
+
+
+def apply_retouch(result, base, strokes, flip=False):
+    """Restore / Clone / Eraser strokes replayed in order on a tool result (C,H,W or H,W, ARRAY row order).  Strokes are in display
+    coordinates (row 0 = top of the picture; flip=True: the picture is the array flipped vertically, as Siril shows it).
+    Restore blends toward base (the image before the tool); Clone copies from the stroke's source offset (fixed from its first point,
+    sampled from the image as it was before that stroke, like Umbra Astro Studio); Eraser blends back to the plain result."""
+    if not strokes:
+        return result
+    r = np.asarray(result, np.float32)
+    mono = r.ndim == 2
+    R = r[None] if mono else r
+    B = np.asarray(base, np.float32)
+    B = B[None] if B.ndim == 2 else B
+    if B.shape != R.shape:
+        B = R
+    if flip:
+        R, B = R[:, ::-1], B[:, ::-1]
+    O = np.array(R, np.float32, copy=True)
+    H, W = O.shape[-2:]
+    for st in strokes:
+        X0, Y0, X1, Y1 = _stroke_window((H, W), st)
+        if X1 <= X0 or Y1 <= Y0:
+            continue
+        one = dict(points=st['points'], size=st['size'], softness=st['softness'], opacity=st['opacity'], erase=False)
+        cov = brush_mask((H, W), [one], (X0, Y0, X1, Y1))
+        if not cov.any():
+            continue
+        patch = O[:, Y0:Y1, X0:X1]
+        if st.get('erase'):
+            target = R[:, Y0:Y1, X0:X1]
+        elif st.get('layer') == 'clone' and st.get('source') is not None:
+            d = (np.array(st['source'], np.float64) - np.array(st['points'][0], np.float64)) * np.array([max(W - 1, 1), max(H - 1, 1)])
+            yy, xx = np.mgrid[Y0:Y1, X0:X1]
+            mx, my = xx + d[0], yy + d[1]
+            cov = cov * ((mx >= 0) & (mx <= W - 1) & (my >= 0) & (my <= H - 1))
+            target = _bilinear(O, mx, my)
+        elif st.get('layer') == 'keep':
+            target = B[:, Y0:Y1, X0:X1]
+        else:
+            continue
+        patch += cov[None] * (target - patch)
+    if flip:
+        O = O[:, ::-1]
+    O = np.ascontiguousarray(O)
+    return O[0] if mono else O
+
+
 # ----------------------------------------------------------------------------------------------- UI
 STYLE = """
 QWidget { background: #242424; color: #dddddd; font-size: 10pt; }
@@ -807,7 +967,7 @@ QCheckBox { spacing: 4px; background: transparent; }
 QCheckBox::indicator { width: 12px; height: 12px; border: 1px solid #777777; border-radius: 3px; background: #3c3c3c; }
 QCheckBox::indicator:checked { background: #1679db; border-color: #6eb5ff; }
 QCheckBox::indicator:disabled { border-color: #555555; background: #2e2e2e; }
-QComboBox { background: transparent; border: none; padding: 5px 25px 5px 9px; min-height: 18px; }
+QComboBox { background: transparent; border: none; padding: 5px 25px 5px 9px; min-height: 18px; combobox-popup: 0; }
 QComboBox QAbstractItemView { background: #3d3d3d; color: #dddddd; border: 1px solid #666666; border-radius: 9px; padding: 5px; selection-background-color: #1679db; outline: 0; }
 QComboBox QAbstractItemView::item { padding: 5px 8px; border-radius: 5px; }
 QPushButton { background: #505050; border: 1px solid #666666; border-radius: 5px; padding: 4px 7px; }
@@ -833,6 +993,7 @@ QProgressBar { border: 1px solid #444444; border-radius: 3px; max-height: 6px; }
 QProgressBar::chunk { background: #1474d5; }
 """
 
+MAX_STEPS = 10           # Undo history: the original + this many Apply steps (each a full-size float32 copy)
 PANE_SIDE = 2400          # longest side of the images shown in the zoomable pane
 IDLE_SIRIL = 'Set the controls, then press Preview or Apply. Apply replaces the image in Siril (Undo available).'
 IDLE_TEST = 'Test mode (no Siril).'
@@ -845,7 +1006,7 @@ def _qt():
     if _QT:
         return _QT['ns']
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt6.QtGui import QImage, QPixmap
+    from PyQt6.QtGui import QImage, QPixmap, QShortcut, QKeySequence
     from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QProgressBar,
                                  QComboBox, QCheckBox, QSizePolicy, QStackedWidget, QMenu, QLayout)
 
@@ -862,6 +1023,10 @@ def _qt():
             self.setMinimumHeight(28)
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             view = QListView(self); view.setFrameShape(QFrame.Shape.NoFrame); view.setSpacing(1); self.setView(view)
+            self.setMaxVisibleItems(100)                 # whole list at once, drops below the box, no scroll arrows
+            self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)   # long names are elided, not widening the column
+            self.setMinimumContentsLength(14)
+            self.setStyleSheet('QComboBox { combobox-popup: 0; }')
 
         def paintEvent(self, event):
             p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -889,6 +1054,19 @@ def _qt():
             container.setStyleSheet('QFrame#RoundedComboPopup {background:#3d3d3d;border:1px solid #666666;border-radius:10px;padding:4px;} '
                                     'QListView {background:#3d3d3d;color:#dddddd;border:none;border-radius:7px;padding:3px;outline:0;} '
                                     'QListView::item {padding:5px 8px;border-radius:5px;} QListView::item:selected {background:#1679db;}')
+            v = self.view()                           # grow the popup until the whole list fits (never a scroll bar)
+            want = v.sizeHintForColumn(0) + 40          # wide enough for the longest name
+            if want > container.width():
+                scr = self.screen().availableGeometry() if self.screen() else None
+                w = min(want, scr.right() - container.x() - 4) if scr else want
+                container.resize(max(container.width(), w), container.height())
+            v.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            for _ in range(4):
+                extra = v.verticalScrollBar().maximum()
+                if extra <= 0:
+                    break
+                container.resize(container.width(), container.height() + extra + 2)
+                QApplication.processEvents()
 
     class Worker(QThread):
         done = pyqtSignal(object, object, float, str, object)
@@ -971,7 +1149,9 @@ def _qt():
             self.tool = 'navigate'                  # navigate | remove | keep | erase
             self.strokes = None                     # list owned by the tool page, or None = no brushes
             self.brush = dict(size=0.03, opacity=1.0, softness=0.35)
-            self.colors = {'remove': (255, 60, 60), 'keep': (60, 220, 90), 'erase': (235, 235, 235)}
+            self.colors = {'remove': (255, 60, 60), 'keep': (60, 220, 90), 'erase': (235, 235, 235), 'clone': (114, 186, 255)}
+            self.clone_source = [0.5, 0.5]           # Clone: where the blue ring is (normalized display coordinates); owned by the page
+            self.drag_source = False
             self.on_stroke = None
             self.draft = None
             self.cursor_pos = None
@@ -1011,15 +1191,31 @@ def _qt():
         def _inside(self, pos):
             return not self.item.pixmap().isNull() and QRectF(self.item.pixmap().rect()).contains(pos)
 
+        def brush_radius(self):
+            h, w = self.image_shape()
+            return max(self.brush['size'] * min(h, w) / 2, 0.5)
+
+        def near_source(self, pos):
+            if self.tool != 'clone':
+                return False
+            c = self._scene(self.clone_source)
+            return math.hypot(pos.x() - c.x(), pos.y() - c.y()) <= max(self.brush_radius(), 9 / max(abs(self.transform().m11()), 1e-5))
+
         def mousePressEvent(self, e):
             if e.button() == Qt.MouseButton.MiddleButton:
                 self.mpan = e.position(); e.accept(); return
             if self.tool != 'navigate' and self.strokes is not None and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
                 pos = self.mapToScene(e.position().toPoint())
+                if e.button() == Qt.MouseButton.LeftButton and self._inside(pos) and self.near_source(pos):   # move the Clone source ring
+                    self.drag_source = True
+                    self.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                    e.accept(); return
                 if self._inside(pos) and len(self.strokes) < self.max_strokes:
                     erase = self.tool == 'erase' or e.button() == Qt.MouseButton.RightButton
                     self.draft = dict(layer='both' if erase else self.tool, erase=bool(erase), size=float(self.brush['size']),
                                       softness=float(self.brush['softness']), opacity=float(self.brush['opacity']), points=[self._norm(pos)])
+                    if self.tool == 'clone' and not erase:
+                        self.draft['source'] = [round(v, 7) for v in self.clone_source]
                     self.strokes.append(self.draft)
                     self.cursor_pos = pos
                     self.viewport().update()
@@ -1034,6 +1230,12 @@ def _qt():
                 e.accept(); return
             pos = self.mapToScene(e.position().toPoint())
             self.cursor_pos = pos if self._inside(pos) else None
+            if self.drag_source:
+                self.clone_source[:] = self._norm(pos)
+                self.viewport().update(); e.accept(); return
+            if self.tool == 'clone' and self.draft is None:
+                self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor if (self.cursor_pos is not None and self.near_source(pos))
+                                                  else Qt.CursorShape.CrossCursor))
             if self.draft is not None:
                 if self._inside(pos) and len(self.draft['points']) < self.max_points:
                     last = self._scene(self.draft['points'][-1])
@@ -1047,6 +1249,10 @@ def _qt():
         def mouseReleaseEvent(self, e):
             if e.button() == Qt.MouseButton.MiddleButton:
                 self.mpan = None; e.accept(); return
+            if self.drag_source:
+                self.drag_source = False
+                self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+                self.viewport().update(); e.accept(); return
             if self.draft is not None:
                 self.draft = None
                 self.viewport().update()
@@ -1131,7 +1337,8 @@ def _qt():
             h, w = self.image_shape()
             if self.draft is not None:          # live trail while the mouse is down (the marks image is rebuilt on release)
                 pts = [self._scene(q) for q in self.draft['points']]
-                pen = QPen(QColor(*self.colors['erase' if self.draft['erase'] else self.draft['layer']], int(60 + 80 * self.draft['opacity'])))
+                pen = QPen(QColor(*self.colors['erase' if self.draft['erase'] else self.draft['layer']], int(60 + 80 * self.draft['opacity'])
+                                  if self.draft['layer'] != 'clone' else 40))
                 pen.setWidthF(max(self.draft['size'] * min(h, w), 1.0))
                 pen.setCapStyle(Qt.PenCapStyle.RoundCap); pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                 p.save(); p.setPen(pen)
@@ -1143,6 +1350,9 @@ def _qt():
                         path.lineTo(q)
                     p.drawPath(path)
                 p.restore()
+            if self.tool == 'clone' and not self.item.pixmap().isNull():
+                self.draw_clone(p)
+                return
             if self.tool != 'navigate' and self.cursor_pos is not None:
                 rad = max(self.brush['size'] * min(h, w) / 2, 0.5)
                 p.save(); p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1151,6 +1361,39 @@ def _qt():
                 pen = QPen(QColor(*self.colors[self.tool]), 1); pen.setCosmetic(True); p.setPen(pen)
                 p.drawEllipse(self.cursor_pos, rad, rad)
                 p.restore()
+
+        def draw_clone(self, p):
+            """Clone (like Umbra Astro Studio): the blue source ring (drag it), and under the brush a ghost of the patch it will copy."""
+            rad = self.brush_radius()
+            scale = max(abs(self.transform().m11()), 1e-5)
+            src = self._scene(self.clone_source)
+            anchor = src
+            if self.draft is not None and self.draft.get('source') is not None and self.cursor_pos is not None:
+                first = self._scene(self.draft['points'][0])
+                anchor = QPointF(src.x() + self.cursor_pos.x() - first.x(), src.y() + self.cursor_pos.y() - first.y())
+            p.save(); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for centre in ([src] if anchor is src else [src, anchor]):
+                pen = QPen(QColor('#141414'), 3); pen.setCosmetic(True); p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(centre, rad, rad)
+                pen = QPen(QColor('#72baff'), 1); pen.setCosmetic(True); pen.setStyle(Qt.PenStyle.DashLine); p.setPen(pen)
+                p.drawEllipse(centre, rad, rad)
+                p.drawLine(centre + QPointF(-5 / scale, 0), centre + QPointF(5 / scale, 0))
+                p.drawLine(centre + QPointF(0, -5 / scale), centre + QPointF(0, 5 / scale))
+            c = self.cursor_pos
+            if c is not None and not self.drag_source and (self.draft is not None or not self.near_source(c)):
+                clip = QPainterPath(); clip.addEllipse(c, rad, rad)
+                p.save(); p.setClipPath(clip); p.setOpacity(0.85 * float(self.brush['opacity']))
+                pm = self.item.pixmap()
+                p.drawPixmap(QRectF(c.x() - rad, c.y() - rad, 2 * rad, 2 * rad), pm, QRectF(anchor.x() - rad, anchor.y() - rad, 2 * rad, 2 * rad))
+                p.restore()
+                pen = QPen(QColor('#111111'), 3); pen.setCosmetic(True); p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(c, rad, rad)
+                pen = QPen(QColor('#eeeeee'), 1); pen.setCosmetic(True); p.setPen(pen)
+                p.drawEllipse(c, rad, rad)
+                pen.setStyle(Qt.PenStyle.DotLine); p.setPen(pen)
+                inner = rad * (1 - float(self.brush['softness']))
+                p.drawEllipse(c, inner, inner)
+            p.restore()
 
     class PreviewWindow(QWidget):
         """The image pane on the right of the window (shared by all tools): the original before a run, then before / after with the
@@ -1166,6 +1409,13 @@ def _qt():
             lay.setSpacing(6)
             row = QHBoxLayout()
             row.setSpacing(6)
+            self.undo_btn = QPushButton('Undo')      # like Umbra Astro Studio: step back / forward through Apply results (all tools)
+            self.undo_btn.setToolTip('Undo the last Apply (any tool). Cmd/Ctrl+Z. The image in Siril changes only with Apply to Siril.')
+            self.redo_btn = QPushButton('Redo')
+            self.redo_btn.setToolTip('Redo the step that was undone. Cmd/Ctrl+Shift+Z.')
+            self.undo_btn.setEnabled(False); self.redo_btn.setEnabled(False)
+            row.addWidget(self.undo_btn); row.addWidget(self.redo_btn)
+            row.addSpacing(6)
             self.caption = QLabel('', objectName='Badge')
             row.addWidget(self.caption)
             row.addStretch(1)
@@ -1331,6 +1581,148 @@ def _qt():
         def model_dir(self):
             return model_dir(self.view.spec)[0]
 
+    class BrushCard:
+        """Second card for Denoise / Deblur / Gradient: a Restore brush paints back the image the tool started from (the result is
+        blended toward it under the marks, no new AI run).  Greyed out until Apply has made a result."""
+        RESTORE_TIP = 'Paint where the result should go back to the image before this tool. Click again to go back to panning.'
+
+        def __init__(self, ui, host):
+            self.host = host
+            self.card2 = QWidget(objectName='Card')
+            self.card2.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+            layout = QVBoxLayout(self.card2)
+            layout.setContentsMargins(12, 10, 12, 12)
+            self.ready_note = ui.note(layout, 'Press Apply above first. Then paint with Restore to bring back the image before this tool.')
+            ui.note(layout, 'Restore paints back the image from before this tool. Clone copies from the blue ring: drag the ring '
+                            'onto a clean area, then paint over what you want to cover. Eraser (or right-click) takes marks away. '
+                            'Click a pressed brush again to pan. [ and ] change the brush size; hold Space to see the original.')
+            row = QHBoxLayout(); row.setSpacing(4)
+            self.tool_btns = {}
+            for key, text, tip in (('keep', 'Restore', self.RESTORE_TIP),
+                                   ('clone', 'Clone', 'Copy from the blue source ring (drag it to move it) onto where you paint, like Umbra Astro '
+                                                      'Studio. Click again to go back to panning.'),
+                                   ('erase', 'Eraser', 'Takes Restore and Clone marks away (or right-click with any brush). Click again to go back to panning.')):
+                b = QPushButton(text); b.setCheckable(True); b.setToolTip(tip); b.setMinimumHeight(26)
+                b.clicked.connect(lambda checked, k=key: self.set_tool(k if checked else 'navigate'))
+                row.addWidget(b); self.tool_btns[key] = b
+            layout.addLayout(row)
+            self.brush = ui.slider(layout, 'Brush size', 1, 100, 30, lambda v: f'{v}', 'Brush diameter. Keys [ and ] make it smaller / bigger.')
+            self.opacity = ui.slider(layout, 'Opacity', 5, 100, 100, lambda v: f'{v}%',
+                                     'Strength of each new stroke: 100% brings the original back fully, lower values partly.')
+            row2 = QHBoxLayout()
+            self.show_marks = ui.check(row2, 'Show marks', 'Show the painted marks over the image.', True)
+            self.clear_btn = QPushButton('Clear marks'); self.clear_btn.setToolTip('Removes all marks.')
+            self.clear_btn.clicked.connect(self.clear_marks)
+            row2.addStretch(1); row2.addWidget(self.clear_btn)
+            layout.addLayout(row2)
+            self.strokes, self.pane, self.pending, self.ready = [], None, False, False
+            self.clone_source = [0.5, 0.5]
+            self.timer = QTimer(); self.timer.setSingleShot(True); self.timer.timeout.connect(self.rerun)
+            self.brush.valueChanged.connect(lambda v: self.sync_brush())
+            self.opacity.valueChanged.connect(lambda v: self.sync_brush())
+            self.show_marks.toggled.connect(lambda _=False: self.update_overlay())
+            self.set_ready(False)
+
+        def set_ready(self, flag):
+            self.ready = bool(flag)
+            self.card2.setEnabled(self.ready)
+            self.ready_note.setVisible(not self.ready)
+            if not self.ready:
+                self.set_tool('navigate')
+
+        def reset(self):
+            """The image this tool starts from changed (another step, Undo...): marks belong to the old one."""
+            self.strokes.clear()
+            self.set_ready(False)
+            self.update_overlay()
+
+        def pane_activated(self, pane):
+            self.pane = pane
+            pane.view.set_brush(self.strokes, self.stroke_done)
+            pane.view.clone_source = self.clone_source
+            pane.view.set_tool(self.current_tool())
+            self.sync_brush()
+            self.update_overlay()
+
+        def current_tool(self):
+            return next((k for k, b in self.tool_btns.items() if b.isChecked()), 'navigate')
+
+        def set_tool(self, key):
+            for k, b in self.tool_btns.items():
+                b.setChecked(k == key)
+            if self.pane is not None and self.pane.view.strokes is self.strokes:
+                self.pane.view.set_tool(key)
+
+        def sync_brush(self):
+            if self.pane is not None and self.pane.view.strokes is self.strokes:
+                self.pane.view.brush.update(size=brush_fraction(self.brush.value()), opacity=self.opacity.value() / 100.0, softness=SOFTNESS)
+                self.pane.view.viewport().update()
+
+        def update_overlay(self):
+            if self.pane is None or self.pane.view.strokes is not self.strokes:
+                return
+            v = self.pane.view
+            h, w = v.image_shape()
+            if not self.strokes or not self.show_marks.isChecked() or h < 2 or w < 2 or not has_paint(self.strokes, 'keep'):
+                v.set_overlay(None)
+                return
+            m = brush_mask((h, w), stroke_layers(self.strokes, 'keep')) * 0.45
+            rgba = np.zeros((h, w, 4), np.uint8)
+            rgba[..., 0], rgba[..., 1], rgba[..., 2] = KEEP_RGB
+            rgba[..., 3] = np.clip(m * 255, 0, 255).astype(np.uint8)
+            q = QImage(np.ascontiguousarray(rgba).data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+            v.set_overlay(QPixmap.fromImage(q))
+
+        def stroke_done(self):
+            self.update_overlay()
+            if self.ready:
+                self.timer.start(150)
+
+        def rerun(self):
+            if self.host.busy:
+                self.pending = True
+                return
+            if self.host.model_path():
+                self.host.start('preview')
+
+        def after_run(self):
+            self.set_ready(True)
+            self.update_overlay()
+            if self.pending:
+                self.pending = False
+                self.timer.start(50)
+
+        def clear_marks(self):
+            had = bool(self.strokes)
+            self.strokes.clear()
+            self.update_overlay()
+            if had and self.ready:
+                self.timer.start(50)
+
+        def apply(self, out, base, flip):
+            """Restore / Clone / Eraser strokes replayed on the result."""
+            if not self.strokes:
+                return out
+            return apply_retouch(out, base, self.strokes, flip)
+
+        def label(self):
+            parts = [n for k, n in (('keep', 'restore'), ('clone', 'clone')) if any(s['layer'] == k and not s['erase'] for s in self.strokes)]
+            return f" ({' + '.join(parts)} brush)" if parts else ''
+
+        def signature(self):
+            return strokes_signature(self.strokes) if self.strokes else ''
+
+        def settings(self):
+            return dict(brush=self.brush.value(), opacity=self.opacity.value())
+
+        def set_settings(self, d):
+            for k, w in (('brush', self.brush), ('opacity', self.opacity)):
+                if k in (d or {}):
+                    try:
+                        w.setValue(int(d[k]))
+                    except Exception:
+                        pass
+
     class ToolView(QWidget):
         """One tool: title, model card + tool controls, Preview / Apply, progress, status, Close. Used alone or as a page of the combined window."""
         def __init__(self, spec, siril=None, fake_image=None, prefs=None, upd=None, show_title=True, smoke=False, pane=None):
@@ -1381,10 +1773,22 @@ def _qt():
             self.upd_note.setTextFormat(Qt.TextFormat.RichText)
             self.upd_note.hide()
             cl.addWidget(self.upd_note)
+            self.top_apply_row = None
+            if spec.apply_top and spec.inline_preview:   # Apply under the model row (left); the tool controls go in a second card
+                self.top_apply_row = QHBoxLayout()
+                cl.addSpacing(4); cl.addLayout(self.top_apply_row)
             self.ui = Ui(self)
             self.panel = spec.build_panel(self.ui, cl, self)
             self.panel.set_settings(saved_settings)
             lay.addWidget(card)
+            self.brushes = None
+            card2 = getattr(self.panel, 'card2', None)
+            if card2 is None and spec.restore_brush:
+                self.brushes = BrushCard(self.ui, self)
+                self.brushes.set_settings((saved_settings or {}).get('_brush', {}))
+                card2 = self.brushes.card2
+            if card2 is not None:
+                lay.addWidget(card2)
             brow2 = QHBoxLayout()
             self.preview_btn = QPushButton('Preview')
             self.preview_btn.setToolTip('Runs on the selection in Siril (or a centred crop) and shows the result here. The image is not changed.' if not spec.preview_whole
@@ -1392,12 +1796,19 @@ def _qt():
             self.preview_btn.clicked.connect(lambda: self.start('preview'))
             self.apply_btn = QPushButton('Apply', objectName='Apply')
             self.apply_btn.clicked.connect(lambda: self.start('apply'))
-            if spec.inline_preview:                   # Apply shows the result in the window; Apply to Siril (beside Close) writes it
+            if spec.inline_preview:                   # Apply (small blue, inside the card) shows the result; Apply to Siril (beside Close) writes it
                 self.preview_btn.setText('Apply')
+                self.preview_btn.setObjectName('Apply')
+                self.preview_btn.setMinimumWidth(90)
                 self.preview_btn.setToolTip('Runs on the whole image and shows the result on the right. The image in Siril is not changed.')
                 self.apply_btn.setText('Apply to Siril')
                 self.apply_btn.setToolTip('Writes the result to the image in Siril (Undo available). Reuses the result shown on the right when nothing has changed.')
-                brow2.addWidget(self.preview_btn)
+                if self.top_apply_row is not None:
+                    self.top_apply_row.addStretch(1); self.top_apply_row.addWidget(self.preview_btn)
+                else:
+                    arow = QHBoxLayout()
+                    arow.addStretch(1); arow.addWidget(self.preview_btn)
+                    cl.addSpacing(4); cl.addLayout(arow)
             else:
                 brow2.addWidget(self.preview_btn); brow2.addWidget(self.apply_btn)
             self.edit_btn = None
@@ -1406,7 +1817,8 @@ def _qt():
                 self.edit_btn.setToolTip('Opens the editor for correction marks (Remove / Keep brushes) on the whole image.')
                 self.edit_btn.clicked.connect(lambda: self.start('edit'))
                 brow2.addWidget(self.edit_btn)
-            lay.addLayout(brow2)
+            if brow2.count():
+                lay.addLayout(brow2)
             prow = QHBoxLayout()
             self.progress = QProgressBar()
             self.progress.setRange(0, 0); self.progress.setTextVisible(False); self.progress.hide()
@@ -1445,15 +1857,16 @@ def _qt():
             if self.preview is None:
                 return
             self.preview.set_alt(self.spec.alt[0] if self.spec.alt else None)
-            hook = getattr(self.panel, 'pane_activated', None)
+            hook = getattr(self.panel, 'pane_activated', None) if self.brushes is None else self.brushes.pane_activated
             if hook is not None:
                 hook(self.preview)
             else:
                 self.preview.view.set_brush(None)
-            if self.pane_state is not None and self.pane_state[0] == getattr(w, 'orig_identity', None):
+            if self.pane_state is not None and self.pane_state[0] == getattr(w, 'head_id', lambda: None)():
                 self.preview.show_state(dict(self.pane_state[1], keep_view=True))
             else:
-                getattr(w, 'show_original', lambda: None)()
+                getattr(w, 'show_current', lambda: None)()
+            getattr(w, 'check_view', lambda v: None)(self)
 
         # ---- status
         def set_status(self, msg, error=False):
@@ -1504,7 +1917,10 @@ def _qt():
 
         def save_prefs(self):
             if self.prefs:
-                self.prefs.save(self.spec.key, self.model_path(), self.panel.settings(), getattr(self.window(), 'current_key', None))
+                st = dict(self.panel.settings())
+                if getattr(self, 'brushes', None) is not None:
+                    st['_brush'] = self.brushes.settings()
+                self.prefs.save(self.spec.key, self.model_path(), st, getattr(self.window(), 'current_key', None))
 
         def set_busy(self, flag, net=False):
             self.busy = flag
@@ -1513,9 +1929,8 @@ def _qt():
             self.update_dl_button(busy=flag)
             if getattr(self, 'edit_btn', None) is not None:
                 self.edit_btn.setEnabled(not flag and has)
-            if getattr(self, 'undo_btn', None) is not None:
-                self.undo_btn.setEnabled(not flag and bool(getattr(self.window(), 'applied', False)))
             self.model_box.setEnabled(not flag)
+            getattr(self.window(), 'update_history_buttons', lambda: None)()
             self.progress.setVisible(flag); self.cancel_btn.setVisible(flag and not net)
             if flag:
                 self.progress.setRange(0, 0)
@@ -1684,44 +2099,31 @@ def _qt():
                 hook()
 
         def undo_all(self):
-            """Write back the image this window started with (keeps a Siril Undo state, so this can be undone too)."""
-            w = self.window()
-            start = getattr(w, 'start_image', None)
-            if start is None or self.busy:
-                return
-            data, meta = start
-            try:
-                if self.siril is not None:
-                    ident = write_result(self.siril, data, meta, w.orig_identity, f'{self.spec.name} {VERSION} undo all')
-                    self.siril.log(f'{self.spec.name}: Undo all - the image is back to how it was when the window opened.')
-                else:
-                    ident = fingerprint(data)
-            except Exception as e:
-                self.set_status(f'Undo all failed: {e}', True)
-                return
-            for v in w.views.values():
-                v.cache = None; v.pane_state = None; v.result = None
-            w.note_image(ident, data, show=True)
-            w.applied = False
-            for v in w.views.values():
-                v.undo_btn.setEnabled(False)
-            self.set_status('Undo all: the image is back to how it was when the window opened.')
+            getattr(self.window(), 'undo_all', lambda v: None)(self)
 
         def read_image(self, kind):
-            """-> (data, meta, identity, header_text, region note, rect)"""
-            sp = self.spec
-            if self.siril is not None:
-                with self.siril.image_lock():
-                    raw = read_pixels(self.siril)
-                    data, meta = decode_pixels(raw)
-                    identity = fingerprint(raw)
-                    htxt = siril_header_text(self.siril)
-            else:
-                data, meta, identity, htxt = self.fake, dict(dtype=np.dtype('float32'), shape=self.fake.shape), fingerprint(self.fake), ''
-            return data, meta, identity, htxt
+            """-> (data, meta, identity, header_text): the image this tool starts from (the window's current image, see MainWindow.base_for)."""
+            w = self.window()
+            b = w.base_for(self.spec.key) if hasattr(w, 'base_for') else None
+            if b is None:
+                raise RuntimeError('No image loaded in Siril.')
+            return b['data'], w.meta, ('h', b['id']), w.htxt
+
+        def job_key(self):
+            """Same key start() builds for a run with the current settings."""
+            params = dict(self.panel.params())
+            params.update(self.spec.image_params(getattr(self.window(), 'htxt', '')))
+            params = self.spec.preview_params(params)
+            return json.dumps(params, sort_keys=True, default=str) + str(self.model_path()) + self.brush_sig()
+
+        def brush_sig(self):
+            return self.brushes.signature() if self.brushes is not None else ''
 
         def start(self, kind):
             if self.busy:
+                return
+            if kind == 'apply' and self.spec.inline_preview and hasattr(self.window(), 'apply_to_siril'):
+                self.window().apply_to_siril(self)       # writes the window's current image (all tools' Apply steps) to Siril
                 return
             if getattr(self.panel, 'editor_busy', lambda: False)():
                 self.set_status('The preview window is still working. Wait until it has finished.')
@@ -1765,7 +2167,7 @@ def _qt():
                 else:
                     region = f'whole image {data.shape[-1]}×{data.shape[-2]} px'
             key = json.dumps(params, sort_keys=True, default=str) + str(path)
-            if kind == 'apply' and sp.reuse_preview and self.cache and identity is not None and self.cache[0] == identity and self.cache[1] == key:
+            if (kind == 'apply' or (kind == 'preview' and self.brushes is not None)) and sp.reuse_preview and self.cache and identity is not None and self.cache[0] == identity and self.cache[1] == key:
                 self.job = dict(kind=kind, meta=meta, identity=identity, params=params, region=region, data=data, key=key, htxt=htxt)
                 self.finish(self.cache[2], self.cache[3], 0.0, self.cache[4], self.cache[5], reused=True)
                 return
@@ -1827,8 +2229,21 @@ def _qt():
                         out = out[sl]
                         job = dict(job, data=job['data'][sl])
                         info = dict(info, **{k: np.asarray(v)[sl] for k, v in info.items() if isinstance(v, np.ndarray) and v.ndim >= 2})
-                    self.show_preview(out, info, job)
-                    QTimer.singleShot(0, getattr(self.panel, 'after_run', lambda: None))
+                    raw = out
+                    lab = f"{sp.name} {sp.label(job['params'])}"
+                    if self.brushes is not None:
+                        out = self.brushes.apply(out, job['data'], self.siril is not None)
+                        lab += self.brushes.label()
+                    st = self.show_preview(out, info, job)
+                    w = self.window()
+                    if hasattr(w, 'commit'):
+                        w.commit(sp.key, sp.output(job['params'], out, info), lab, job['params'], info, job['key'] + self.brush_sig())
+                        self.pane_state = (w.head_id(), st)
+                    out = raw
+                    QTimer.singleShot(0, self.brushes.after_run if self.brushes is not None else getattr(self.panel, 'after_run', lambda: None))
+                    if getattr(self, 'pending_write', False):
+                        self.pending_write = False
+                        QTimer.singleShot(0, lambda: w.write_head(self))
                     if sp.reuse_preview and job['identity'] is not None:
                         self.cache = (job['identity'], job['key'], out, info, provider, note)
                     self.result = out
@@ -1842,8 +2257,6 @@ def _qt():
                 if self.siril is not None:
                     self.cache = None
                     self.job['identity'] = write_result(self.siril, write_out, job['meta'], job['identity'], label)
-                    getattr(self.window(), 'note_image', lambda *a, **k: None)(self.job['identity'], write_out, show=True)   # the pane shows the new image
-                    getattr(self.window(), 'mark_applied', lambda: None)()
                     msg = sp.post_apply(ctx, job['params'], info) or ''
                     self.siril.log(f'{label} done in {secs:.1f} s (Undo available).' + (' ' + msg if msg else ''))
                 H0, W0 = job['data'].shape[-2:]
@@ -1868,11 +2281,11 @@ def _qt():
                 alt8 = to_rgb8(alt, sp_before if getattr(sp, 'alt_same_stretch', False) else stretch_params(alt), flip)
             self.last_preview = (b8, a8, alt8)
             w = self.window()
-            getattr(w, 'note_image', lambda *a: None)(job.get('identity'), job.get('full'))
             self.preview.set_alt(sp.alt[0] if sp.alt else None)
             self.preview.size_note = f' · {job["data"].shape[-1]}×{job["data"].shape[-2]} px'
             st = self.preview.show_result(b8, a8, alt8, f'Preview of the {job["region"]}. Same auto-stretch for before and after.')
-            self.pane_state = (getattr(w, 'orig_identity', job.get('identity')), st)
+            self.pane_state = (None, st)
+            return st
 
         def shutdown(self):
             for t in (self.worker, self.net):
@@ -1894,8 +2307,10 @@ def _qt():
             self.siril, self.fake = siril, fake_image
             self.setStyleSheet(STYLE)
             self.views = {}
-            self.orig_identity, self.orig_state = None, None
-            self.start_image, self.applied = None, False
+            # the working image: every Apply adds a step; all tools start from the current step; Apply to Siril writes it
+            self.hist, self.hidx, self.next_id = [], 0, 1
+            self.meta, self.htxt, self.siril_fp, self.written_id = None, '', None, 0
+            self._cur = None
             outer = QHBoxLayout(self)
             outer.setContentsMargins(0, 0, 0, 0)
             outer.setSpacing(0)
@@ -1960,6 +2375,11 @@ def _qt():
             avail = QApplication.primaryScreen().availableGeometry()   # fit the screen, like Umbra Guided GHS
             self.resize(min(1400, avail.width() - 40), min(900, avail.height() - 40))
             self.setMinimumSize(self.left_w + 360, 520)
+            QApplication.instance().installEventFilter(self)       # Space (hold) and [ ] work wherever the keyboard focus is
+            self.pane.undo_btn.clicked.connect(self.undo)
+            self.pane.redo_btn.clicked.connect(self.redo)
+            QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self, self.undo)
+            QShortcut(QKeySequence(QKeySequence.StandardKey.Redo), self, self.redo)
             self.switch(self.current_key, initial=True)
             QTimer.singleShot(0, self.load_original)
 
@@ -1974,59 +2394,239 @@ def _qt():
         def refit(self):
             self.adjustSize()
 
-        # ---- the original image in the pane
+        # ---- the working image and its history (Undo / Redo / Undo all / Apply to Siril)
+        def read_source(self):
+            """-> (data, meta, fingerprint, header text) of the image in Siril (or the test image)."""
+            if self.siril is not None:
+                with self.siril.image_lock():
+                    raw = read_pixels(self.siril)
+                    data, meta = decode_pixels(raw)
+                    return data, meta, fingerprint(raw), siril_header_text(self.siril)
+            f = self.fake
+            return f, dict(dtype=np.dtype('float32'), shape=f.shape), fingerprint(f), ''
+
         def load_original(self):
-            """Read the image (from Siril, or the test image) and show it in the pane, auto-stretched."""
+            """Read the image once when the window opens; it is step 0 of the history."""
             try:
-                data, meta, identity, htxt = self.view().read_image('preview')
+                data, meta, fp, htxt = self.read_source()
             except Exception:
-                self.orig_identity, self.orig_state = None, None
+                self.hist = []
                 self.pane.show_state(None)
                 return
-            if getattr(self, 'start_image', None) is None:          # for Undo all
-                self.start_image = (np.array(data, copy=True), meta)
-            self.note_image(identity, data, show=True)
-            self.view().activate()                                  # brushes etc. for the first page
+            arr = np.array(data, np.float32, copy=True)
+            arr.setflags(write=False)
+            self.hist = [dict(id=0, data=arr, label='Original', tool=None, params=None, info=None, key=None, open=False, posted=True)]
+            self.hidx, self.meta, self.htxt, self.siril_fp, self.written_id = 0, meta, htxt, fp, 0
+            self.view().activate()
+            self.update_history_buttons()
 
-        def mark_applied(self):
-            self.applied = True
+        def head(self):
+            return self.hist[self.hidx] if self.hist else None
+
+        def head_id(self):
+            h = self.head()
+            return None if h is None else h['id']
+
+        def base_index(self, key):
+            """A tool re-applying (new settings, slider, brush) replaces its own latest step; otherwise it starts from the current step."""
+            i = self.hidx
+            return i - 1 if (i > 0 and self.hist[i]['tool'] == key and self.hist[i]['open']) else i
+
+        def base_for(self, key):
+            return self.hist[self.base_index(key)] if self.hist else None
+
+        def open_step(self, key):
+            return self.hist[self.hidx] if (self.hist and self.base_index(key) < self.hidx) else None
+
+        def busy_any(self):
+            return any(v.busy for v in self.views.values())
+
+        def commit(self, key, data, label, params, info, jkey):
+            arr = np.array(data, np.float32, copy=True)
+            arr.setflags(write=False)
+            e = dict(id=self.next_id, data=arr, label=label, tool=key, params=params, info=info, key=jkey, open=True, posted=False)
+            self.next_id += 1
+            if self.base_index(key) < self.hidx:
+                self.hist[self.hidx] = e
+            else:
+                for h in self.hist:
+                    h['open'] = False
+                del self.hist[self.hidx + 1:]
+                self.hist.append(e)
+                self.hidx += 1
+            while len(self.hist) > MAX_STEPS + 1 and self.hidx > 1:     # memory: keep the original + the last MAX_STEPS steps
+                del self.hist[1]
+                self.hidx -= 1
+            self.update_history_buttons()
+
+        def history_changed(self):
             for v in self.views.values():
-                v.undo_btn.setEnabled(not v.busy)
+                v.cache = None; v.result = None; v.last_preview = None; v.pane_state = None
+                if getattr(v, 'brushes', None) is not None:
+                    v.brushes.set_ready(False)
+            for h in self.hist:
+                h['open'] = False
+            self.view().activate()
+            self.update_history_buttons()
 
-        def note_image(self, identity, data, show=False):
-            """Remember the current image (identity + display copy). show: put it in the pane now."""
-            if identity is None or data is None:
+        def undo(self):
+            if not self.hist or self.hidx == 0 or self.busy_any():
                 return
-            if identity != self.orig_identity or self.orig_state is None:
-                full = np.asarray(data, np.float32)
+            gone = self.hist[self.hidx]['label']
+            self.hidx -= 1
+            self.history_changed()
+            self.view().set_status(f'Undo: removed {gone}. Redo brings it back. The image in Siril changes only with Apply to Siril.')
+
+        def redo(self):
+            if not self.hist or self.hidx >= len(self.hist) - 1 or self.busy_any():
+                return
+            self.hidx += 1
+            self.history_changed()
+            self.view().set_status(f"Redo: {self.hist[self.hidx]['label']}. Press Apply to Siril to write it.")
+
+        def can_undo_all(self):
+            return bool(self.hist) and (self.hidx > 0 or self.written_id != 0)
+
+        def update_history_buttons(self):
+            busy = self.busy_any()
+            self.pane.undo_btn.setEnabled(bool(self.hist) and self.hidx > 0 and not busy)
+            self.pane.redo_btn.setEnabled(bool(self.hist) and self.hidx < len(self.hist) - 1 and not busy)
+            for v in self.views.values():
+                v.undo_btn.setEnabled(self.can_undo_all() and not busy)
+
+        def undo_all(self, view):
+            """Back to the image as it was when the window opened, in the window and (if something was written) in Siril. Redo still works."""
+            if not self.can_undo_all() or self.busy_any():
+                return
+            wrote = False
+            if self.written_id != 0:
+                if self.siril is not None:
+                    try:
+                        self.siril_fp = write_result(self.siril, self.hist[0]['data'], self.meta, self.siril_fp, f'Umbra {VERSION} undo all')
+                        self.siril.log('Umbra: Undo all - the image is back to how it was when the window opened.')
+                        wrote = True
+                    except Exception as e:
+                        view.set_status(f'Undo all could not put the original back in Siril: {e}', True)
+                        return
+                self.written_id = 0
+            self.hidx = 0
+            self.history_changed()
+            self.view().set_status('Undo all: back to the image as it was when this window opened' + (', also in Siril.' if wrote else '.')
+                                   + (' Redo brings the steps back.' if len(self.hist) > 1 else ''))
+
+        def apply_to_siril(self, view):
+            if not self.hist or self.busy_any():
+                return
+            op = self.open_step(view.spec.key)
+            if op is not None and view.model_path() and op['key'] != view.job_key():   # settings changed since this tool's Apply: run, then write
+                view.pending_write = True
+                view.start('preview')
+                return
+            if self.hidx == 0 and self.written_id == 0:
+                view.set_status('Nothing to write yet. Press Apply to see the result, then Apply to Siril.')
+                return
+            self.write_head(view)
+
+        def write_head(self, view):
+            h = self.head()
+            if h is None:
+                return
+            if h['id'] == self.written_id:
+                view.set_status('The image in Siril already is the current result.')
+                return
+            chain = self.hist[1:self.hidx + 1]
+            label = ('Umbra: ' + ' + '.join(e['label'] for e in chain)) if chain else 'Umbra: back to the original'
+            msgs = []
+            if self.siril is not None:
+                try:
+                    self.siril_fp = write_result(self.siril, h['data'], self.meta, self.siril_fp, f'{label} ({VERSION})')
+                except Exception as e:
+                    view.set_status(f'Apply to Siril failed: {e}', True)
+                    return
+                for e in chain:                                   # side outputs (Starless: starmask_<file>) once per step
+                    if e['posted']:
+                        continue
+                    sv = self.views.get(e['tool'])
+                    if sv is not None:
+                        ctx = types.SimpleNamespace(siril=self.siril, header_text=self.htxt, history=e['label'], view=sv)
+                        try:
+                            m = sv.spec.post_apply(ctx, e['params'], e['info'] or {})
+                        except Exception as ex:
+                            m = f'{sv.spec.name}: could not save its extra file ({ex}).'
+                        if m:
+                            msgs.append(m)
+                    e['posted'] = True
+                try:
+                    self.siril.log(f'{label}: applied (Siril Undo available).' + (' ' + ' '.join(msgs) if msgs else ''))
+                except Exception:
+                    pass
+            self.written_id = h['id']
+            self.update_history_buttons()
+            view.set_status(('Applied to Siril (Siril Undo also works).' if self.siril is not None else 'Test mode: nothing was written.')
+                            + (' ' + ' '.join(msgs) if msgs else ''))
+
+        def brush_slider(self):
+            v = self.view()
+            if getattr(v, 'brushes', None) is not None:
+                return v.brushes.brush if v.brushes.ready else None
+            b = getattr(v.panel, 'brush', None)
+            return b if (b is not None and b.isEnabled()) else None
+
+        def eventFilter(self, obj, e):
+            t = e.type()
+            if t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and self.isActiveWindow():
+                from PyQt6.QtWidgets import QLineEdit, QAbstractSpinBox
+                if isinstance(QApplication.focusWidget(), (QLineEdit, QAbstractSpinBox)):
+                    return False
+                k = e.key()
+                if k == Qt.Key.Key_Space:
+                    if not e.isAutoRepeat():
+                        self.pane.hold(t == QEvent.Type.KeyPress)
+                    return True
+                if k in (Qt.Key.Key_BracketLeft, Qt.Key.Key_BracketRight) and t == QEvent.Type.KeyPress:
+                    s = self.brush_slider()
+                    if s is not None:
+                        step = max(1, round(s.value() * 0.15))
+                        s.setValue(s.value() + (step if k == Qt.Key.Key_BracketRight else -step))
+                    return True
+            return False
+
+        def show_current(self):
+            """The pane shows the current image (the original, or the result of the steps so far)."""
+            h = self.head()
+            if h is None:
+                self.pane.show_state(None)
+                return
+            if self._cur is None or self._cur[0] != h['id']:
+                full = h['data']
                 b = pool_for_display(full, PANE_SIDE)
                 b8 = to_rgb8(b, stretch_params(b), self.siril is not None)
                 p = QPixmap.fromImage(qimage(b8))
-                self.orig_identity = identity
-                self.orig_state = dict(pix={'before': p, 'after': p}, result=False, caption=f'Original · {full.shape[-1]}×{full.shape[-2]} px', note='')
-                self.check_image(full)
-            if show:
-                self.show_original()
-
-        def check_image(self, full):
-            """Tool pages that adapt to the image (Deblur: no stars -> Automatic PSF greyed out) check it in the background."""
-            self._checks = [t for t in getattr(self, '_checks', []) if t.isRunning()]
-            for v in self.views.values():
-                fn, cb = getattr(v.panel, 'image_check', None), getattr(v.panel, 'image_checked', None)
-                if fn is None or cb is None:
-                    continue
-                t = Task(lambda prog, fn=fn: fn(full))
-                t.done.connect(lambda r, cb=cb: cb(r))
-                t.failed.connect(lambda m: None)
-                self._checks.append(t)
-                t.start()
+                cap = (f'Original · {full.shape[-1]}×{full.shape[-2]} px' if self.hidx == 0
+                       else f"Current image · {self.hidx} step{'s' if self.hidx > 1 else ''} · {full.shape[-1]}×{full.shape[-2]} px")
+                self._cur = (h['id'], dict(pix={'before': p, 'after': p}, result=False, caption=cap, note=''))
+            self.pane.set_alt(None)
+            self.pane.show_state(dict(self._cur[1], keep_view=True))
 
         def show_original(self):
-            if self.orig_state is None:
-                self.pane.show_state(None)
+            self.show_current()
+
+        def check_view(self, v):
+            """Tool pages that adapt to the image they start from (Deblur: no stars -> Automatic PSF greyed out) check it in the background."""
+            b = self.base_for(v.spec.key)
+            fn, cb = getattr(v.panel, 'image_check', None), getattr(v.panel, 'image_checked', None)
+            if b is not None and getattr(v, 'brushes', None) is not None and getattr(v, 'brush_base', None) != b['id']:
+                v.brush_base = b['id']
+                v.brushes.reset()
+            if b is None or fn is None or cb is None or getattr(v, 'checked_id', None) == b['id']:
                 return
-            self.pane.set_alt(None)
-            self.pane.show_state(dict(self.orig_state, keep_view=True))
+            v.checked_id = b['id']
+            self._checks = [t for t in getattr(self, '_checks', []) if t.isRunning()]
+            t = Task(lambda prog, fn=fn, d=b['data']: fn(d))
+            t.done.connect(lambda r, cb=cb: cb(r))
+            t.failed.connect(lambda m: None)
+            self._checks.append(t)
+            t.start()
 
         def switch(self, key, initial=False):
             if not initial:
